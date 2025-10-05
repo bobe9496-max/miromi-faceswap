@@ -1,0 +1,7 @@
+
+streamlit>=1.37
+insightface>=0.7
+onnxruntime-gpu>=1.18; platform_system=="Windows"
+onnxruntime>=1.18; platform_system!="Windows"
+opencv-python>=4.9.0
+numpy>=1.26
