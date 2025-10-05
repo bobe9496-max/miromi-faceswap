@@ -1,15 +1,16 @@
-# app.py — Miromi Wedding Face Swap (2 faces, Streamlit Cloud + Git LFS friendly)
+# app.py — Miromi Wedding Face Swap (Streamlit Cloud + Git LFS friendly)
+# - 로컬(models/inswapper_128.onnx; Git LFS) → 홈 캐시 → 사용자 URL → InsightFace 릴리스 순서로 모델 로드
 # - 성별 고려 자동 매핑 + 수동 오버라이드
-# - 소스 얼굴 썸네일/파일명 표시
 # - 단일 소스 이미지에서 2명 자동 추출(좌→우)
 # - 사전 업스케일(SSAA) + 선택적 사후 업스케일
 # - 피부톤 동기화(Reinhard) + Poisson 블렌딩 + 언샵/CLAHE 옵션
 # - 원본 해상도 유지, OpenCV headless 환경 호환
-# - 로컬 모델(models/inswapper_128.onnx) 있으면 우선 사용(Git LFS), 없으면 자동 다운로드
 
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # 일부 환경에서 MKL 충돌 방지
 
+import requests
+from pathlib import Path
 import streamlit as st
 import numpy as np
 import cv2
@@ -18,14 +19,15 @@ from insightface.model_zoo import get_model
 
 st.set_page_config(page_title="Miromi Wedding Face Swap (2 faces)", layout="wide")
 
+
 # -----------------------------
 # Utilities
 # -----------------------------
-def read_image(file) -> np.ndarray:
+def read_image(file):
     """Bytes or path -> BGR np.ndarray"""
     if hasattr(file, "read"):
-        file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        data = np.asarray(bytearray(file.read()), dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     else:
         img = cv2.imread(str(file), cv2.IMREAD_COLOR)
     if img is None:
@@ -33,7 +35,6 @@ def read_image(file) -> np.ndarray:
     return img
 
 def bgr2rgb(img): return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-def rgb2bgr(img): return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 def clamp_rect(x1,y1,x2,y2,w,h):
     x1 = max(0, min(int(x1), w-1)); x2 = max(0, min(int(x2), w))
@@ -45,15 +46,15 @@ def clamp_rect(x1,y1,x2,y2,w,h):
 def crop_face(img_bgr, face, pad=0.25):
     h, w = img_bgr.shape[:2]
     x1,y1,x2,y2 = map(int, face.bbox)
-    cx = (x1+x2)/2; cy = (y1+y2)/2
-    bw = (x2-x1); bh = (y2-y1)
-    bw2 = int(bw*(1+pad)); bh2 = int(bh*(1+pad*1.2))
-    x1n = int(cx - bw2/2); x2n = int(cx + bw2/2)
-    y1n = int(cy - bh2/2); y2n = int(cy + bh2/2)
+    cx, cy = (x1+x2)/2, (y1+y2)/2
+    bw, bh = (x2-x1), (y2-y1)
+    bw2, bh2 = int(bw*(1+pad)), int(bh*(1+pad*1.2))
+    x1n, x2n = int(cx - bw2/2), int(cx + bw2/2)
+    y1n, y2n = int(cy - bh2/2), int(cy + bh2/2)
     x1n,y1n,x2n,y2n = clamp_rect(x1n,y1n,x2n,y2n,w,h)
     return img_bgr[y1n:y2n, x1n:x2n]
 
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+def cosine_sim(a, b):
     a = a.flatten(); b = b.flatten()
     denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
     return float(np.dot(a, b) / denom)
@@ -66,6 +67,7 @@ def draw_faces_preview(img_bgr, faces, color=(0,255,0)):
         cv2.putText(vis, f"#{idx}", (x1, max(0,y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
     return vis
+
 
 # -----------------------------
 # Gender-aware mapping
@@ -86,7 +88,7 @@ def gender_label(x): return {"M":"남","F":"여", None:"불명"}[x]
 
 def map_sources_to_targets_gender_aware(src_faces, tgt_faces, src_feats, tgt_feats, gender_penalty=0.35):
     """2명 기준 최적 매핑: 성별 일치 우선 + 코사인 유사도"""
-    m = len(src_faces); n = len(tgt_faces)
+    m, n = len(src_faces), len(tgt_faces)
     assert m in (1,2)
     src_g = [get_sex(f) for f in src_faces]
     tgt_g = [get_sex(f) for f in tgt_faces]
@@ -108,20 +110,18 @@ def map_sources_to_targets_gender_aware(src_faces, tgt_faces, src_feats, tgt_fea
         best = min(range(n), key=lambda j: cost([(0, j)]))
         return [(0, best, float(sims[0, best]))], sims
 
-    # m == 2: 두 경우 완전 탐색
     import itertools
-    best_pair, best_cost = None, 1e9
-    best_sims = None
+    best_pair, best_cost, best_sims = None, 1e9, None
     for j0, j1 in itertools.permutations(range(n), 2):
         pr = [(0, j0), (1, j1)]
         c = cost(pr)
         if c < best_cost:
-            best_cost = c
-            best_pair = pr
+            best_cost, best_pair = c, pr
             best_sims = (sims[0, j0], sims[1, j1])
     mapping = [(best_pair[0][0], best_pair[0][1], float(best_sims[0])),
                (best_pair[1][0], best_pair[1][1], float(best_sims[1]))]
     return mapping, sims
+
 
 # -----------------------------
 # Harmonization / Detail
@@ -157,24 +157,63 @@ def clahe_L(img):
     l2 = clahe.apply(l)
     return cv2.cvtColor(cv2.merge([l2,a,b]), cv2.COLOR_LAB2BGR)
 
+
 # -----------------------------
-# Models (GPU toggle-safe, local model first)
+# Model loader (LFS/local → cache → custom URL → release)
 # -----------------------------
-@st.cache_resource(show_spinner=False)
+def _download_to(path: Path, url: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024*1024):
+                if chunk: f.write(chunk)
+    return path
+
+def get_inswapper(providers):
+    local = Path("models/inswapper_128.onnx")             # Git LFS 권장
+    cache = Path.home() / ".insightface" / "models" / "inswapper_128.onnx"
+    custom_url = ""
+    try:
+        # Streamlit Secrets 우선
+        custom_url = (st.secrets.get("INSWAPPER_URL") or "").strip()
+    except Exception:
+        pass
+    # 환경변수 폴백
+    custom_url = (custom_url or os.getenv("INSWAPPER_URL", "")).strip()
+
+    # 1) 저장소 포함 파일
+    if local.exists() and local.stat().st_size > 10_000_000:
+        st.info(f"Using bundled model: {local}")
+        return get_model(str(local), providers=providers)
+
+    # 2) 홈 캐시
+    if cache.exists() and cache.stat().st_size > 10_000_000:
+        st.info(f"Using cached model: {cache}")
+        return get_model(str(cache), providers=providers)
+
+    # 3) 사용자 지정 URL (예: 본인 HuggingFace/릴리스 direct 링크)
+    if custom_url:
+        st.warning("Downloading inswapper_128.onnx from INSWAPPER_URL …")
+        try:
+            _download_to(cache, custom_url)
+            st.success("Download complete.")
+            return get_model(str(cache), providers=providers)
+        except Exception as e:
+            st.error(f"Custom URL download failed: {e}")
+
+    # 4) InsightFace 릴리스(클라우드에서 실패 가능)
+    st.warning("Falling back to InsightFace release download (may fail on Cloud).")
+    return get_model("inswapper_128.onnx", providers=providers, download=True, download_zip=True)
+
+@st.cache_resource(show_spinner="모델 로딩 중…")
 def load_models(use_gpu=False, det_size=(640,640)):
     providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_gpu else ['CPUExecutionProvider']
-
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=(0 if use_gpu else -1), det_size=det_size)
-
-    # 로컬 모델 우선 (Git LFS로 저장소에 models/inswapper_128.onnx 넣어두면 제일 빠름)
-    local_swapper = "models/inswapper_128.onnx"
-    if os.path.exists(local_swapper):
-        swapper = get_model(local_swapper, providers=providers)
-    else:
-        # 로컬이 없으면 InsightFace 공식 릴리즈에서 자동 다운로드 시도
-        swapper = get_model('inswapper_128.onnx', download=True, download_zip=True, providers=providers)
+    swapper = get_inswapper(providers)
     return app, swapper
+
 
 # -----------------------------
 # UI
@@ -184,28 +223,34 @@ st.caption("Event-ready • 2인 얼굴 스왑 • ID 일관성 • 자연스러
 
 with st.sidebar:
     st.header("세팅")
-    gpu = st.checkbox("GPU 사용 (CUDA)", value=False)  # 클라우드 기본 False
+    gpu = st.checkbox("GPU 사용 (CUDA)", value=False)  # 클라우드는 보통 False
     det = st.select_slider("검출 해상도", [320, 480, 640, 800, 960], value=800)
 
     st.subheader("해상도 / 품질")
-    pre_scale = st.select_slider("사전 업스케일(SSAA)", [1.0, 1.25, 1.5, 1.75, 2.0], value=1.5)
+    pre_scale = float(st.select_slider("사전 업스케일(SSAA)", [1.0, 1.25, 1.5, 1.75, 2.0], value=1.5))
     keep_prescaled = st.checkbox("최종 해상도: 사전 업스케일 유지", value=True)
-    post_scale = st.select_slider("사후 업스케일", [1.0, 1.25, 1.5, 1.75, 2.0], value=1.0)
+    post_scale = float(st.select_slider("사후 업스케일", [1.0, 1.25, 1.5, 1.75, 2.0], value=1.0))
 
     st.subheader("보정 옵션")
     keep_color = st.checkbox("피부톤 동기화 (Reinhard)", value=True)
     use_poisson = st.checkbox("경계 블렌딩 (Poisson)", value=True)
-    detail_boost = st.slider("얼굴 디테일 (언샵)", 0.0, 1.2, 0.5, 0.1)
+    detail_boost = float(st.slider("얼굴 디테일 (언샵)", 0.0, 1.2, 0.5, 0.1))
     use_clahe = st.checkbox("얼굴 CLAHE(명암 디테일)", value=False)
+
+    # (비상용) 모델 수동 업로드
+    up = st.file_uploader("모델 수동 업로드(.onnx) — 컨테이너 재시작 시 사라질 수 있음", type=["onnx"])
+    if up:
+        Path("models").mkdir(exist_ok=True)
+        with open("models/inswapper_128.onnx", "wb") as f:
+            f.write(up.getbuffer())
+        st.success("모델 저장 완료! Rerun 해주세요(F5).")
 
     app, swapper = load_models(use_gpu=gpu, det_size=(det, det))
 
 st.subheader("1) 소스 모드")
 mode = st.radio("소스를 어떻게 올릴까요?", ["개별 업로드 (A/B)", "한 장에서 자동 2명"])
 
-src_files = []
-multi_img = None
-
+src_files, multi_img = [], None
 if mode == "개별 업로드 (A/B)":
     c1, c2 = st.columns(2)
     with c1:
@@ -221,6 +266,7 @@ st.subheader("2) 타겟 웨딩 사진 업로드 (두 얼굴이 보이면 안정�
 tfile = st.file_uploader("타겟", type=["jpg","jpeg","png"], key="target")
 
 run = st.button("얼굴 스왑 실행", type="primary", use_container_width=True)
+
 
 # -----------------------------
 # Main
@@ -272,7 +318,6 @@ if run:
         st.stop()
     tgt_orig = read_image(tfile)
     oh, ow = tgt_orig.shape[:2]
-    pre_scale = float(pre_scale)
     if pre_scale > 1.0:
         nw, nh = int(ow*pre_scale), int(oh*pre_scale)
         tgt_for_detect = cv2.resize(tgt_orig, (nw, nh), interpolation=cv2.INTER_CUBIC)
@@ -324,8 +369,8 @@ if run:
 
         if keep_color and patch_swapped.size>0 and patch_target.size>0:
             patch_swapped = reinhard_transfer(patch_swapped, patch_target)
-        if float(detail_boost) > 0.0:
-            patch_swapped = unsharp_mask(patch_swapped, radius=1.2, amount=float(detail_boost))
+        if detail_boost > 0.0:
+            patch_swapped = unsharp_mask(patch_swapped, radius=1.2, amount=detail_boost)
         if use_clahe:
             patch_swapped = clahe_L(patch_swapped)
 
@@ -345,9 +390,9 @@ if run:
     # --- 사전 업스케일 되돌림(선택) + 사후 업스케일 ---
     if not keep_prescaled and pre_scale > 1.0:
         out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_AREA)
-    if post_scale and float(post_scale) > 1.0:
+    if post_scale and post_scale > 1.0:
         out = cv2.resize(out,
-                         (int(out.shape[1]*float(post_scale)), int(out.shape[0]*float(post_scale))),
+                         (int(out.shape[1]*post_scale), int(out.shape[0]*post_scale)),
                          interpolation=cv2.INTER_CUBIC)
 
     st.success("완료! 아래 결과를 확인해 주세요.")
