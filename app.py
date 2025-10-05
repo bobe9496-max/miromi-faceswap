@@ -1,11 +1,11 @@
-# app.py — Miromi Wedding Face Swap (2 faces, cloud-friendly)
+# app.py — Miromi Wedding Face Swap (2 faces, Streamlit Cloud + Git LFS friendly)
 # - 성별 고려 자동 매핑 + 수동 오버라이드
 # - 소스 얼굴 썸네일/파일명 표시
 # - 단일 소스 이미지에서 2명 자동 추출(좌→우)
 # - 사전 업스케일(SSAA) + 선택적 사후 업스케일
 # - 피부톤 동기화(Reinhard) + Poisson 블렌딩 + 언샵/CLAHE 옵션
-# - 원본 해상도 유지, Streamlit Cloud에서 동작(헤드리스 OpenCV)
-# - 로컬 모델(models/inswapper_128.onnx) 있으면 우선 사용, 없으면 자동 다운로드
+# - 원본 해상도 유지, OpenCV headless 환경 호환
+# - 로컬 모델(models/inswapper_128.onnx) 있으면 우선 사용(Git LFS), 없으면 자동 다운로드
 
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # 일부 환경에서 MKL 충돌 방지
@@ -17,7 +17,6 @@ from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
 
 st.set_page_config(page_title="Miromi Wedding Face Swap (2 faces)", layout="wide")
-
 
 # -----------------------------
 # Utilities
@@ -67,7 +66,6 @@ def draw_faces_preview(img_bgr, faces, color=(0,255,0)):
         cv2.putText(vis, f"#{idx}", (x1, max(0,y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
     return vis
-
 
 # -----------------------------
 # Gender-aware mapping
@@ -125,7 +123,6 @@ def map_sources_to_targets_gender_aware(src_faces, tgt_faces, src_feats, tgt_fea
                (best_pair[1][0], best_pair[1][1], float(best_sims[1]))]
     return mapping, sims
 
-
 # -----------------------------
 # Harmonization / Detail
 # -----------------------------
@@ -160,7 +157,6 @@ def clahe_L(img):
     l2 = clahe.apply(l)
     return cv2.cvtColor(cv2.merge([l2,a,b]), cv2.COLOR_LAB2BGR)
 
-
 # -----------------------------
 # Models (GPU toggle-safe, local model first)
 # -----------------------------
@@ -171,14 +167,14 @@ def load_models(use_gpu=False, det_size=(640,640)):
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=(0 if use_gpu else -1), det_size=det_size)
 
-    # 로컬 모델 우선
+    # 로컬 모델 우선 (Git LFS로 저장소에 models/inswapper_128.onnx 넣어두면 제일 빠름)
     local_swapper = "models/inswapper_128.onnx"
     if os.path.exists(local_swapper):
         swapper = get_model(local_swapper, providers=providers)
     else:
+        # 로컬이 없으면 InsightFace 공식 릴리즈에서 자동 다운로드 시도
         swapper = get_model('inswapper_128.onnx', download=True, download_zip=True, providers=providers)
     return app, swapper
-
 
 # -----------------------------
 # UI
@@ -225,7 +221,6 @@ st.subheader("2) 타겟 웨딩 사진 업로드 (두 얼굴이 보이면 안정�
 tfile = st.file_uploader("타겟", type=["jpg","jpeg","png"], key="target")
 
 run = st.button("얼굴 스왑 실행", type="primary", use_container_width=True)
-
 
 # -----------------------------
 # Main
