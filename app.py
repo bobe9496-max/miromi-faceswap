@@ -277,6 +277,7 @@ if run:
         st.stop()
     tgt_orig = read_image(tfile)
     oh, ow = tgt_orig.shape[:2]
+    pre_scale = float(pre_scale)
     if pre_scale > 1.0:
         nw, nh = int(ow*pre_scale), int(oh*pre_scale)
         tgt_for_detect = cv2.resize(tgt_orig, (nw, nh), interpolation=cv2.INTER_CUBIC)
@@ -328,7 +329,7 @@ if run:
 
         if keep_color and patch_swapped.size>0 and patch_target.size>0:
             patch_swapped = reinhard_transfer(patch_swapped, patch_target)
-        if detail_boost > 0.0:
+        if float(detail_boost) > 0.0:
             patch_swapped = unsharp_mask(patch_swapped, radius=1.2, amount=float(detail_boost))
         if use_clahe:
             patch_swapped = clahe_L(patch_swapped)
@@ -349,9 +350,9 @@ if run:
     # --- 사전 업스케일 되돌림(선택) + 사후 업스케일 ---
     if not keep_prescaled and pre_scale > 1.0:
         out = cv2.resize(out, (ow, oh), interpolation=cv2.INTER_AREA)
-    if post_scale and post_scale > 1.0:
+    if post_scale and float(post_scale) > 1.0:
         out = cv2.resize(out,
-                         (int(out.shape[1]*post_scale), int(out.shape[0]*post_scale)),
+                         (int(out.shape[1]*float(post_scale)), int(out.shape[0]*float(post_scale))),
                          interpolation=cv2.INTER_CUBIC)
 
     st.success("완료! 아래 결과를 확인해 주세요.")
